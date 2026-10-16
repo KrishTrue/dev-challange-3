@@ -1,0 +1,12 @@
+node_modules
+dist
+.env
+/generated/prisma
+
+fixes
+
+/src/generated/prisma
+
+/generated/prisma
+
+.env.prod

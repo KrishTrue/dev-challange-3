@@ -1,0 +1,365 @@
+/**
+ * Copyright (c) 2026 Keshav Gilhotra. All Rights Reserved.
+ * This file is part of a proprietary project. Unauthorized copying is strictly prohibited.
+ */
+
+import { Request, Response } from 'express'
+import { prisma } from '../config/db.js'
+import { App } from 'octokit'
+import axios from 'axios'
+import jwt from 'jsonwebtoken'
+
+const githubApp = new App({
+  appId: process.env.GITHUB_APP_ID!,
+  privateKey: process.env.GITHUB_PRIVATE_KEY!.replace(/\\n/g, '\n'),
+})
+
+export const createInstallation = async (req: Request, res: Response) => {
+  try {
+    const userId = (req as any).user?.id
+    const { installationId } = req.body
+
+    const installation = await prisma.installation.create({
+      data: {
+        userId: userId,
+        installationId: installationId,
+      },
+    })
+
+    return res.status(200).json({
+      success: true,
+      message: 'Installation created successfully',
+      data: installation,
+    })
+  } catch (err) {
+    console.log(err)
+    return res.status(500).json({
+      success: false,
+      message: 'Failed to create installation',
+      error: err,
+    })
+  }
+}
+
+export const syncRepos = async (req: Request, res: Response) => {
+  try {
+    const userId = (req as any).user.id
+    const { installationId } = req.body
+    if (!userId) {
+      return res.status(401).json({
+        success: false,
+        message: 'Unauthorized',
+      })
+    }
+
+    let findInstallation = await prisma.installation.findFirst({
+      where: { userId: userId },
+    })
+
+    if (!findInstallation) {
+      if (!installationId) {
+        return res.status(400).json({
+          success: false,
+          message: 'installationId is required to register the application.',
+        })
+      }
+      const existingInstallation = await prisma.installation.findUnique({
+        where: { installationId: String(installationId) },
+      })
+      if (existingInstallation) {
+        findInstallation = await prisma.installation.update({
+          where: { id: existingInstallation.id },
+          data: { userId: userId },
+        })
+      } else {
+        findInstallation = await prisma.installation.create({
+          data: {
+            userId: userId,
+            installationId: String(installationId),
+          },
+        })
+      }
+    }
+
+    let githubRepos
+    try {
+      const ocktokit = await githubApp.getInstallationOctokit(
+        Number(findInstallation.installationId),
+      )
+      const response = await ocktokit.request('GET /installation/repositories', {
+        per_page: 100,
+      })
+      githubRepos = response.data.repositories
+    } catch (octokitErr: any) {
+      console.error('Error fetching repositories from GitHub App:', octokitErr)
+      const isInstallationError =
+        octokitErr.status === 404 ||
+        octokitErr.status === 403 ||
+        octokitErr.status === 401 ||
+        (octokitErr.message && (
+          octokitErr.message.toLowerCase().includes('suspended') ||
+          octokitErr.message.toLowerCase().includes('not found') ||
+          octokitErr.message.toLowerCase().includes('bad credentials')
+        ))
+
+      if (isInstallationError) {
+        console.log(`Installation ${findInstallation.installationId} is suspended or deleted on GitHub. Cleaning up local database.`)
+
+        const existingDbRepos = await prisma.repository.findMany({
+          where: { installationId: findInstallation.id },
+        })
+
+        if (existingDbRepos.length > 0) {
+          const secureBotUrl =
+            process.env.SECURE_BOT_SERVICE_BASE_URL ||
+            process.env.SECURE_BOT_URL ||
+            process.env.SECURE_BOT_SERVICE_URL ||
+            'http://localhost:5002'
+
+          const token = jwt.sign(
+            { id: findInstallation.userId },
+            process.env.JWT_SECRET as string,
+          )
+
+          await Promise.all(
+            existingDbRepos.map(async (repo) => {
+              try {
+                await axios.delete(
+                  `${secureBotUrl}/api/secure-bot/scan/delete/data/${repo.id}`,
+                  {
+                    headers: {
+                      Authorization: `Bearer ${token}`,
+                    },
+                  },
+                )
+              } catch (deleteErr) {
+                console.error(`Failed to delete secure-bot history for repo ${repo.repo_name}:`, deleteErr)
+              }
+            }),
+          )
+
+          await prisma.repository.deleteMany({
+            where: {
+              id: {
+                in: existingDbRepos.map((repo) => repo.id),
+              },
+            },
+          })
+        }
+
+        try {
+          await prisma.$executeRawUnsafe(
+            `UPDATE "auth"."User" SET "installationID" = NULL WHERE "id" = $1`,
+            findInstallation.userId,
+          )
+        } catch (dbErr) {
+          console.error('Failed to update User installationID in auth schema:', dbErr)
+        }
+
+        await prisma.installation.delete({
+          where: {
+            id: findInstallation.id,
+          },
+        })
+
+        return res.status(200).json({
+          success: true,
+          message: 'GitHub App installation was suspended or deleted. Local records cleared.',
+          data: null,
+        })
+      }
+
+      throw octokitErr
+    }
+
+    const existingDbRepos = await prisma.repository.findMany({
+      where: { installationId: findInstallation.id },
+    })
+
+    const githubRepoNames = githubRepos.map((repo: any) => repo.full_name)
+    const reposToDelete = existingDbRepos.filter(
+      (repo) => !githubRepoNames.includes(repo.repo_name),
+    )
+
+    if (reposToDelete.length > 0) {
+      const secureBotUrl =
+        process.env.SECURE_BOT_SERVICE_BASE_URL ||
+        process.env.SECURE_BOT_URL ||
+        'http://localhost:5002'
+      const authHeader = req.headers.authorization
+
+      await Promise.all(
+        reposToDelete.map(async (repo) => {
+          try {
+            await axios.delete(
+              `${secureBotUrl}/api/secure-bot/scan/delete/data/${repo.id}`,
+              {
+                headers: {
+                  ...(authHeader ? { Authorization: authHeader } : {}),
+                },
+              },
+            )
+          } catch (deleteErr) {
+            console.error(`Failed to delete secure-bot history for repo ${repo.repo_name}:`, deleteErr)
+          }
+        }),
+      )
+
+      await prisma.repository.deleteMany({
+        where: {
+          id: {
+            in: reposToDelete.map((repo) => repo.id),
+          },
+        },
+      })
+    }
+
+    const syncedRepos = await Promise.all(
+      githubRepos.map(async (repo) => {
+        return prisma.repository.upsert({
+          where: { repo_name: repo.full_name },
+          update: {
+            repo_url: repo.html_url,
+            installationId: findInstallation!.id,
+          },
+          create: {
+            repo_name: repo.full_name,
+            repo_url: repo.html_url,
+            installationId: findInstallation!.id,
+          },
+        })
+      }),
+    )
+
+    return res.status(200).json({
+      success: true,
+      message: 'Repositories synced successfully',
+      data: syncedRepos,
+    })
+  } catch (err) {
+    console.log(err)
+  }
+}
+
+export const getRepository = async (req: Request, res: Response) => {
+  try {
+    const userId = (req as any).user.id
+    if (!userId) {
+      return res.status(401).json({
+        success: false,
+        message: 'Unauthorized',
+      })
+    }
+
+    const { repoId } = req.params
+    if (!repoId) {
+      return res.status(400).json({
+        success: false,
+        message: 'repoId is required to fetch the repository.',
+      })
+    }
+
+    const id = String(repoId)
+
+    const repo = await prisma.repository.findUnique({
+      where: {
+        id: id,
+      },
+      include: {
+        installation: true,
+      },
+    })
+
+    if (!repo) {
+      return res.status(404).json({
+        success: false,
+        message: 'Repository not found',
+      })
+    }
+
+    if (repo.installation.userId !== userId) {
+      return res.status(403).json({
+        success: false,
+        message: 'Unauthorized',
+      })
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: 'Repository fetched successfully',
+      data: {
+        id: repo.id,
+        repo_name: repo.repo_name,
+        repo_url: repo.repo_url,
+        installationId: repo.installation.installationId,
+      },
+    })
+  } catch (err) {
+    console.log(err)
+    return res.status(500).json({ message: 'Failed to fetch repositories' })
+  }
+}
+
+export const getUserRepositories = async (req: Request, res: Response) => {
+  try {
+    const userId = (req as any).user?.id
+    if (!userId) {
+      return res.status(401).json({
+        success: false,
+        message: 'Unauthorized',
+      })
+    }
+
+    const page = parseInt(req.query.page as string, 10) || 1
+    const limit = parseInt(req.query.limit as string, 10) || 9
+    const skip = (page - 1) * limit
+
+    const installation = await prisma.installation.findFirst({
+      where: { userId: userId },
+    })
+
+    if (!installation) {
+      return res.status(200).json({
+        success: true,
+        message: 'No installations found',
+        data: [],
+        pagination: {
+          total: 0,
+          page,
+          limit,
+          pages: 0
+        }
+      })
+    }
+
+    const total = await prisma.repository.count({
+      where: { installationId: installation.id },
+    })
+
+    const repos = await prisma.repository.findMany({
+      where: { installationId: installation.id },
+      orderBy: { createdAt: 'desc' },
+      skip,
+      take: limit,
+    })
+
+    return res.status(200).json({
+      success: true,
+      message: 'Repositories fetched successfully',
+      data: repos,
+      pagination: {
+        total,
+        page,
+        limit,
+        pages: Math.ceil(total / limit)
+      }
+    })
+  } catch (err) {
+    console.error(err)
+    return res.status(500).json({
+      success: false,
+      message: 'Failed to fetch repositories',
+      error: err,
+    })
+  }
+}
