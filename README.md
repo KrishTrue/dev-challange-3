@@ -34,7 +34,11 @@
 - **Queuing & Cache:** BullMQ (job queuing), Redis (state/cache)
 - **Database:** PostgreSQL (isolated via schema namespaces `auth`, `integration`, `bot`)
 - **Database Client:** Prisma ORM
-- **API Clients & Security:** Octokit (GitHub API integration), Gemini AI & OpenRouter (patch generation)
+- **API Clients & Security:** Octokit (GitHub API integration)
+
+### AI & LLM Models
+- **Ollama Model:** Dolphin Mistral 7B (used for vulnerability analysis, reasoning, and automated code patch remediation)
+- **Cloud AI APIs:** Gemini AI & OpenRouter (multi-model fallbacks and PR reviews)
 
 ### Third-Party Scanners
 - **Security Checkers:** Semgrep, Gitleaks, Trivy (run inside transient containers)
@@ -62,7 +66,7 @@ Interfaces with the GitHub App installation flow, retrieves repository access sc
 ### 4. Secure Bot (`services/secure-bot`)
 The core security agent. It processes repository scan requests asynchronously via **BullMQ** job queues. When a task is picked up by a scan worker:
 - It pulls target source code, runs Semgrep/Gitleaks/Trivy scanners.
-- It uses Gemini AI to analyze warnings and generate secure code patches.
+- It uses Ollama (Dolphin Mistral 7B) along with Gemini AI to analyze warnings and generate secure code patches.
 - It commits/pushes remediation branches and automatically opens GitHub Pull Requests.
 
 ---
